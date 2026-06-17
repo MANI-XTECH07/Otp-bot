@@ -1,0 +1,5 @@
+__pycache__
+*.pyc
+otp_cache.json
+bot.log
+.env
