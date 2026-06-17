@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-MANI-OTP BOT - iVASMS scraper with multiple bypass layers
-Optimized for Render deployment
+MANI-OTP BOT - Single file for Render
+Includes Flask keep‑alive + iVASMS scraper
 Developer: MANI-XTECH 🇳🇵
 """
 
@@ -13,16 +13,11 @@ import random
 import asyncio
 import logging
 from datetime import datetime
+from threading import Thread
 from typing import Dict, List, Set
 
-# Try to import playwright, but fallback gracefully
-try:
-    from playwright.async_api import async_playwright
-    PLAYWRIGHT_AVAILABLE = True
-except ImportError:
-    PLAYWRIGHT_AVAILABLE = False
-
 import cloudscraper
+from flask import Flask, jsonify
 from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
 
@@ -32,6 +27,7 @@ ADMIN_IDS = [int(x.strip()) for x in os.environ.get("ADMIN_IDS", "6895265731").s
 IVASMS_EMAIL = os.environ.get("IVASMS_EMAIL", "devilknight0698@gmail.com")
 IVASMS_PASSWORD = os.environ.get("IVASMS_PASSWORD", "9V9GjkFQBz.4#B@")
 CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "15"))
+PORT = int(os.environ.get("PORT", "8000"))
 DATA_FILE = "otp_cache.json"
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -66,20 +62,11 @@ class OTPSet:
     def recent(self, limit=20):
         return [{"otp": k.split("|")[0], "phone": k.split("|")[1] if "|" in k else "?"} for k in list(self.cache)[-limit:]][::-1]
 
-# ======================== IVASMS CLIENT (hybrid: cloudscraper + optional playwright) ========================
+# ======================== IVASMS CLIENT ========================
 class IVASMSClient:
-    def __init__(self, email, password):
+    def __init__(self, email, pwd):
         self.email = email
-        self.password = password
-        self.logged_in = False
-        self.method = "cloudscraper"  # will switch to playwright if needed
-        self.scraper = None
-        self.browser = None
-        self.page = None
-        self.playwright = None
-        self._init_cloudscraper()
-
-    def _init_cloudscraper(self):
+        self.pwd = pwd
         self.scraper = cloudscraper.create_scraper(
             browser={'browser': 'chrome', 'platform': 'windows', 'desktop': True},
             delay=random.uniform(1.5, 3.5)
@@ -99,102 +86,43 @@ class IVASMSClient:
             'Upgrade-Insecure-Requests': '1',
             'Connection': 'keep-alive',
         })
+        self.logged_in = False
 
-    async def _init_playwright(self):
-        if not PLAYWRIGHT_AVAILABLE:
-            logger.error("Playwright not installed")
-            return False
+    def login(self):
         try:
-            p = await async_playwright().start()
-            self.playwright = p
-            self.browser = await p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-dev-shm-usage'])
-            self.page = await self.browser.new_page()
-            logger.info("Playwright browser launched")
-            return True
+            time.sleep(random.uniform(2, 4))
+            r = self.scraper.get("https://ivasms.com/user/login", timeout=25)
+            if r.status_code != 200:
+                logger.error(f"Login page status {r.status_code}")
+                return False
+            csrf = re.search(r'name="_token"\s+value="([^"]+)"', r.text)
+            payload = {"email": self.email, "password": self.pwd, "remember": "1"}
+            if csrf:
+                payload["_token"] = csrf.group(1)
+            time.sleep(random.uniform(1.5, 3))
+            resp = self.scraper.post("https://ivasms.com/user/login", data=payload, timeout=25, allow_redirects=True)
+            if "dashboard" in resp.url.lower() or resp.status_code == 302:
+                dash = self.scraper.get("https://ivasms.com/user/dashboard", timeout=15)
+                if dash.status_code == 200 and ("logout" in dash.text.lower() or "dashboard" in dash.text.lower()):
+                    self.logged_in = True
+                    logger.info("✅ iVASMS login successful")
+                    return True
+            logger.error("Login failed – wrong credentials or site changed")
+            return False
         except Exception as e:
-            logger.error(f"Playwright init failed: {e}")
+            logger.error(f"Login exception: {e}")
             return False
 
-    async def login(self):
-        # Try cloudscraper first
-        if self.method == "cloudscraper":
-            try:
-                time.sleep(random.uniform(2, 4))
-                r = self.scraper.get("https://ivasms.com/user/login", timeout=25)
-                if r.status_code != 200:
-                    logger.error(f"Login page status {r.status_code}")
-                    # Switch to playwright if possible
-                    if PLAYWRIGHT_AVAILABLE:
-                        logger.info("Switching to Playwright...")
-                        self.method = "playwright"
-                        return await self.login()
-                    return False
-                csrf = re.search(r'name="_token"\s+value="([^"]+)"', r.text)
-                payload = {"email": self.email, "password": self.password, "remember": "1"}
-                if csrf:
-                    payload["_token"] = csrf.group(1)
-                time.sleep(random.uniform(1.5, 3))
-                resp = self.scraper.post("https://ivasms.com/user/login", data=payload, timeout=25, allow_redirects=True)
-                if "dashboard" in resp.url.lower() or resp.status_code == 302:
-                    dash = self.scraper.get("https://ivasms.com/user/dashboard", timeout=15)
-                    if dash.status_code == 200 and ("logout" in dash.text.lower() or "dashboard" in dash.text.lower()):
-                        self.logged_in = True
-                        logger.info("✅ iVASMS login successful (cloudscraper)")
-                        return True
-                logger.error("Login failed – wrong credentials or site changed")
-                # Try playwright as fallback
-                if PLAYWRIGHT_AVAILABLE:
-                    logger.info("Fallback to Playwright...")
-                    self.method = "playwright"
-                    return await self.login()
-                return False
-            except Exception as e:
-                logger.error(f"cloudscraper login exception: {e}")
-                if PLAYWRIGHT_AVAILABLE:
-                    self.method = "playwright"
-                    return await self.login()
-                return False
-
-        elif self.method == "playwright":
-            if not self.browser:
-                if not await self._init_playwright():
-                    return False
-            try:
-                await self.page.goto("https://ivasms.com/user/login", wait_until="networkidle")
-                await self.page.fill('input[name="email"]', self.email)
-                await self.page.fill('input[name="password"]', self.password)
-                await self.page.click('button[type="submit"]')
-                await self.page.wait_for_timeout(5000)
-                if await self.page.is_visible('.dashboard, .user-menu, a[href*="logout"]'):
-                    self.logged_in = True
-                    logger.info("✅ iVASMS login successful (Playwright)")
-                    return True
-                else:
-                    logger.error("Playwright login failed")
-                    return False
-            except Exception as e:
-                logger.error(f"Playwright login exception: {e}")
-                return False
-
-    async def fetch_sms(self):
+    def fetch_sms(self):
         if not self.logged_in:
             return ""
-        if self.method == "cloudscraper":
-            try:
-                time.sleep(random.uniform(1.5, 3))
-                r = self.scraper.get("https://ivasms.com/user/sms", timeout=25)
-                return r.text if r.status_code == 200 else ""
-            except Exception as e:
-                logger.error(f"cloudscraper fetch error: {e}")
-                return ""
-        elif self.method == "playwright":
-            try:
-                await self.page.goto("https://ivasms.com/user/sms", wait_until="networkidle")
-                await self.page.wait_for_timeout(2000)
-                return await self.page.content()
-            except Exception as e:
-                logger.error(f"Playwright fetch error: {e}")
-                return ""
+        try:
+            time.sleep(random.uniform(1.5, 3))
+            r = self.scraper.get("https://ivasms.com/user/sms", timeout=25)
+            return r.text if r.status_code == 200 else ""
+        except Exception as e:
+            logger.error(f"SMS fetch error: {e}")
+            return ""
 
     def extract(self, html):
         otps = []
@@ -231,12 +159,6 @@ class IVASMSClient:
                 return s
         return "Unknown"
 
-    async def close(self):
-        if self.browser:
-            await self.browser.close()
-        if self.playwright:
-            await self.playwright.stop()
-
 # ======================== TELEGRAM BOT ========================
 class MANIOTPBot:
     def __init__(self):
@@ -262,12 +184,12 @@ class MANIOTPBot:
             try:
                 if not self.client.logged_in:
                     logger.info("Logging in...")
-                    if await self.client.login():
+                    if self.client.login():
                         logger.info("Login OK")
                     else:
                         await asyncio.sleep(30)
                         continue
-                html = await self.client.fetch_sms()
+                html = self.client.fetch_sms()
                 if html:
                     for o in self.client.extract(html):
                         key = f"{o['otp']}|{o['phone']}"
@@ -307,8 +229,7 @@ class MANIOTPBot:
             f"🔐 iVASMS: {'✅' if self.client.logged_in else '❌'}\n"
             f"📦 Cache: {len(self.cache.cache)}\n"
             f"📈 Total: {self.cache.total}\n"
-            f"⏱️ Uptime: {h}h {m}m\n"
-            f"🛠️ Method: {self.client.method}",
+            f"⏱️ Uptime: {h}h {m}m",
             parse_mode='HTML'
         )
     async def cmd_recent(self, update, context):
@@ -324,7 +245,7 @@ class MANIOTPBot:
         if update.effective_user.id not in ADMIN_IDS:
             return
         await update.message.reply_text("🔄 Testing iVASMS login...")
-        ok = await self.client.login()
+        ok = self.client.login()
         await update.message.reply_text("✅ Login successful" if ok else "❌ Login failed. Check credentials or site.")
     async def cmd_restart(self, update, context):
         if update.effective_user.id not in ADMIN_IDS:
@@ -341,32 +262,59 @@ class MANIOTPBot:
             otp = q.data.split("_")[1]
             await q.edit_message_text(f"✅ Copied: <code>{otp}</code>", parse_mode='HTML')
 
-# ======================== MAIN (for server.py) ========================
+# ======================== FLASK KEEP‑ALIVE ========================
+flask_app = Flask(__name__)
+bot_instance = None
+
+@flask_app.route('/')
+def home():
+    if bot_instance:
+        return jsonify({
+            "status": "running",
+            "logged_in": bot_instance.client.logged_in,
+            "total_otps": bot_instance.cache.total,
+            "uptime": str(datetime.now() - bot_instance.start).split('.')[0]
+        })
+    return jsonify({"status": "initializing"})
+
+def run_flask():
+    flask_app.run(host='0.0.0.0', port=PORT, debug=False, use_reloader=False)
+
+# ======================== MAIN ========================
 async def main():
+    global bot_instance
     if not BOT_TOKEN or not ADMIN_IDS or not IVASMS_EMAIL or not IVASMS_PASSWORD:
         logger.error("Missing environment variables!")
         return
-    bot = MANIOTPBot()
+    bot_instance = MANIOTPBot()
+    # Start Flask in background thread
+    Thread(target=run_flask, daemon=True).start()
+    logger.info(f"Flask server running on port {PORT}")
+
+    # Build Telegram app
     app = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", bot.cmd_start))
-    app.add_handler(CommandHandler("status", bot.cmd_status))
-    app.add_handler(CommandHandler("recent", bot.cmd_recent))
-    app.add_handler(CommandHandler("testlogin", bot.cmd_testlogin))
-    app.add_handler(CommandHandler("restart", bot.cmd_restart))
-    app.add_handler(CallbackQueryHandler(bot.callback))
-    asyncio.create_task(bot.monitor(app.bot))
+    app.add_handler(CommandHandler("start", bot_instance.cmd_start))
+    app.add_handler(CommandHandler("status", bot_instance.cmd_status))
+    app.add_handler(CommandHandler("recent", bot_instance.cmd_recent))
+    app.add_handler(CommandHandler("testlogin", bot_instance.cmd_testlogin))
+    app.add_handler(CommandHandler("restart", bot_instance.cmd_restart))
+    app.add_handler(CallbackQueryHandler(bot_instance.callback))
+
+    # Start monitoring loop
+    asyncio.create_task(bot_instance.monitor(app.bot))
+
+    # Start polling
     await app.initialize()
     await app.start()
     await app.updater.start_polling()
     logger.info("🤖 MANI-OTP Bot is running")
+
     try:
         while True:
             await asyncio.sleep(3600)
     except KeyboardInterrupt:
-        bot.running = False
-        await bot.client.close()
+        bot_instance.running = False
         await app.stop()
 
-# For direct execution (testing)
 if __name__ == "__main__":
     asyncio.run(main())
